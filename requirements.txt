@@ -2,4 +2,4 @@ adafruit-blinka
 adafruit-circuitpython-pca9685
 adafruit-circuitpython-servokit
 colorlog
-keyboard
+pynput

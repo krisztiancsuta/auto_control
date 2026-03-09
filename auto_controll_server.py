@@ -1,7 +1,7 @@
 import socket
 import logging
 import colorlog
-import keyboard
+from pynput import keyboard
 import time
 import argparse
 
@@ -22,6 +22,18 @@ class HandleKey:
         self.host_ip = host_ip
         self.port = port
         self.connect_to_the_car()
+
+        self.press_w = False
+        self.press_a = False
+        self.press_s = False
+        self.press_d = False
+        self.press_p = False
+
+        self.speed = 0.0
+        self.angle = 50
+        self.enable = 0
+        self.max_speed = 1.0
+        self.min_speed = -1.0
 
         self.listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
         self.listener.start()
@@ -80,13 +92,16 @@ class HandleKey:
                 self.press_d = True
             if key.char == 'p':
                 self.press_p = True
-        except AttributeError as e:
-            self.logger.warning(f'special key pressed: {e}')
+        except AttributeError:
+            self.logger.debug(f"on_press  -> special key: {key}")
 
     def on_release(self, key):
         """
         Callback function when a key is released.
         """
+        if key == keyboard.Key.esc:
+            self.logger.warning("ESC released — stopping listener.")
+            return False  # stop listener
         try:
             if key.char == 'w':
                 self.press_w = False
@@ -98,8 +113,8 @@ class HandleKey:
                 self.press_d = False
             if key.char == 'p':
                 self.press_p = False
-        except AttributeError as e:
-            self.logger.warning(f'special key pressed: {e}')
+        except AttributeError:
+            self.logger.debug(f"on_release -> special key: {key}")
 
     def calculate(self):
         """
