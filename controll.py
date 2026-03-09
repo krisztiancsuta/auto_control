@@ -1,3 +1,9 @@
+import os
+
+# Explicitly specify board type to ensure correct Blinka/Jetson.GPIO detection
+# Board: NVIDIA Jetson Orin Nano Engineering Reference Developer Kit Super
+os.environ['BLINKA_JETSON_BOARD'] = 'JETSON_ORIN_NANO'
+
 from adafruit_servokit import ServoKit
 import board
 import busio
@@ -8,6 +14,12 @@ import struct
 import argparse
 import logging
 import colorlog
+
+# ESC pulse-width calibration (from physical ESC calibration)
+ESC_BACKWARD_MAX_US = 1500  # µs — max backward
+ESC_IDLE_US         = 1600  # µs — idle / neutral
+ESC_FORWARD_MAX_US  = 1650  # µs — max forward
+ESC_CHANNEL         = 8
 
 class Control:
     def __init__(self,host_ip, port):
@@ -71,19 +83,36 @@ class Control:
         """
         self.logger.info(f"Founded board: {board.SCL}, {board.SDA}-")  # Log the board information
         i2c = busio.I2C(board.SCL, board.SDA)  # Initialize the I2C bus
-        pca = adafruit_pca9685.PCA9685(i2c)  # Initialize the PCA9685 PWM driver
-
-        # Set the PWM frequency to 250 Hz (standard for ESCs)
-        pca.frequency = 250
 
         self.myKit = ServoKit(channels=16)  # Initialize the ServoKit with 16 channels
+
+        # Direct PCA9685 handle for ESC — 50 Hz matches ESC calibration
+        self.pca = adafruit_pca9685.PCA9685(i2c)
+        self.pca.frequency = 50
         angle = 0  # Initialize angle variable
         speed = 0.0  # Initialize speed variable
         self.myKit.servo[4].actuation_range = 180  # Set actuation range for servo
 
         self.myKit.servo[4].set_pulse_width_range(400, 2000)  # Set pulse width range for servo
+        self._set_esc(0.0)  # Arm ESC at idle
         self.client_socket.send('ready'.encode())  # Send 'ready' message to the client
         self.logger.info("Ready to go!")  # Log ready status
+
+    def _set_esc(self, speed: float) -> None:
+        """
+        Map speed (-1.0 .. 1.0) to calibrated ESC pulse width and apply via PCA9685.
+          speed = -1.0  →  1500 µs  (max backward)
+          speed =  0.0  →  1600 µs  (idle / neutral)
+          speed = +1.0  →  1650 µs  (max forward)
+        """
+        if speed < 0:
+            us = ESC_IDLE_US + speed * (ESC_IDLE_US - ESC_BACKWARD_MAX_US)
+        else:
+            us = ESC_IDLE_US + speed * (ESC_FORWARD_MAX_US - ESC_IDLE_US)
+        us = max(ESC_BACKWARD_MAX_US, min(ESC_FORWARD_MAX_US, int(us)))
+        self.logger.debug(f"ESC speed={speed:.3f}  →  {us} µs")
+        period_us = 1_000_000 / self.pca.frequency
+        self.pca.channels[ESC_CHANNEL].duty_cycle = int(us / period_us * 65535)
 
     def run(self):
         """
@@ -97,14 +126,15 @@ class Control:
                 except socket.error:
                     self.logger.critical("Connection lost")  # Log connection loss
                     self.myKit.servo[4].angle = 50  # Set servo angle to default position
-                    self.myKit.continuous_servo[8].throttle = 0.1  # Set continuous servo throttle to default
+                    self._set_esc(0.0)  # Return ESC to idle
                     break  # Exit loop
                 if not data:
                     self.logger.critical("Connection lost")  # Log connection loss
                     self.myKit.servo[4].angle = 50  # Set servo angle to default position
-                    self.myKit.continuous_servo[8].throttle = 0.1  # Set continuous servo throttle to default
+                    self._set_esc(0.0)  # Return ESC to idle
                     break  # Exit loop
                 decoded = data.decode('utf8').split()  # Decode received data
+                self.logger.info(f"Command received -> speed: {decoded[0]}, angle: {decoded[1]}")  # Print received command
                 if (len(decoded[1].split('-')) > 1):  # Check for data value error
                     self.logger.error("Data value error")  # Log data value error
                 else:
@@ -112,14 +142,14 @@ class Control:
                     angle = float(decoded[1])  # Get angle value
                 if (angle < -0.5 or angle > 100.5):  # Check if angle is out of bounds
                     angle = 50  # Set angle to default position
-                if (speed > 0.5 or speed < -0.5):  # Check if speed is out of bounds
-                    speed = 0.1  # Set speed to default value
+                if (speed > 1.0 or speed < -1.0):  # Check if speed is out of bounds
+                    speed = 0.0  # Set speed to idle
 
                 self.myKit.servo[4].angle = angle  # Set servo angle
-                self.myKit.continuous_servo[8].throttle = speed  # Set continuous servo throttle
+                self._set_esc(speed)  # Set ESC speed
         finally:
             self.myKit.servo[4].angle = 50  # Set servo angle to default position
-            self.myKit.continuous_servo[8].throttle = 0.1  # Set continuous servo throttle to default
+            self._set_esc(0.0)  # Return ESC to idle
 
 
 if __name__ == "__main__":

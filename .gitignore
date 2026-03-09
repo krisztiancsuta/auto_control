@@ -1,0 +1,19 @@
+# Ignore everything
+*
+
+# Un-ignore source files
+!*.py
+!*.md
+!*.txt
+!.gitignore
+
+# Ignore compiled Python / caches (override the *.py exception)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environment
+venv/
+.venv/
+env/
