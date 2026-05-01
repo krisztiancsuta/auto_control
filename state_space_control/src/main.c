@@ -27,7 +27,7 @@
 
 // Tune these constants for your drivetrain/encoder.
 #define ENCODER_COUNTS_PER_REV 127.0f
-#define WHEEL_RADIUS_M 0.05f
+#define WHEEL_RADIUS_M 0.055f
 
 // Reference speed [m/s]. Will be subscribed from ROS 2 if available.
 #define REF_SPEED_MPS_DEFAULT 0.1f
@@ -35,14 +35,17 @@
 #define MICRO_ROS_AGENT_PING_TIMEOUT_MS 1000
 #define MICRO_ROS_AGENT_PING_ATTEMPTS 120u
 
+// Toggle mode: true = serial debug output, false = micro-ROS node mode.
+#define DEBUG true
+
 // Controller output from Simulink saturation block: [-10, +10] N.
 #define CTRL_FORCE_MIN_N -10.0f
 #define CTRL_FORCE_MAX_N 10.0f
 
 // ESC pulse widths in microseconds (calibrate for your ESC).
-#define ESC_MIN_US 1000u
+#define ESC_MIN_US 1400u
 #define ESC_NEUTRAL_US 1500u
-#define ESC_MAX_US 2000u
+#define ESC_MAX_US 1700u
 
 static PIO g_pio = pio0;
 static const uint g_sm = 0;
@@ -223,12 +226,15 @@ int main(void) {
 
     printf("Using default reference speed: %.2f m/s\r\n", REF_SPEED_MPS_DEFAULT);
 
-    if (!micro_ros_init_subscription()) {
-        printf("micro-ROS agent not reachable, continuing with default reference speed\r\n");
+    if (DEBUG) {
+        printf("DEBUG=true -> serial mode\r\n");
+        printf("Printing: elapsed_ms, encoder_count, speed_mps, force_n, ref_speed, pwm_us, last_interval, callback_count, min_interval, max_interval\r\n");
+    } else if (!micro_ros_init_subscription()) {
+        printf("micro-ROS agent not reachable, continuing with serial status output\r\n");
     }
 
     while (true) {
-        if (g_micro_ros_connected) {
+        if (!DEBUG && g_micro_ros_connected) {
             (void)rclc_executor_spin_some(&g_executor, RCL_MS_TO_NS(100));
             continue;
         }
@@ -242,6 +248,7 @@ int main(void) {
         uint32_t callback_count;
         uint32_t min_interval;
         uint32_t max_interval;
+        uint32_t elapsed_ms;
 
         uint32_t irq_state = save_and_disable_interrupts();
         encoder_count = g_encoder_count;
@@ -255,91 +262,19 @@ int main(void) {
         max_interval = g_max_interval_us;
         restore_interrupts(irq_state);
 
-        fflush(stdout);
+        elapsed_ms = to_ms_since_boot(get_absolute_time());
+
+         printf("elapsed_ms=%lu encoder_count=%ld speed_mps=%.4f force_n=%.4f ref_speed=%.4f pwm_us=%u last_interval=%lu callback_count=%lu min_interval=%lu max_interval=%lu\r\n",
+               (unsigned long)elapsed_ms,
+               (long)encoder_count,
+             (double)speed_mps,
+             (double)force_n,
+             (double)ref_speed,
+             (unsigned int)pwm_us,
+             (unsigned long)last_interval,
+             (unsigned long)callback_count,
+             (unsigned long)min_interval,
+             (unsigned long)max_interval);
+        sleep_ms(100);
     }
 }
-/*
-#include <stdio.h>
-
-#include <rcl/rcl.h>
-#include <rcl/error_handling.h>
-#include <rclc/rclc.h>
-#include <rclc/executor.h>
-#include <std_msgs/msg/int32.h>
-#include <rmw_microros/rmw_microros.h>
-
-#include "pico/stdlib.h"
-#include "pico_uart_transports.h"
-
-const uint LED_PIN = 25;
-
-rcl_publisher_t publisher;
-std_msgs__msg__Int32 msg;
-
-void timer_callback(rcl_timer_t *timer, int64_t last_call_time)
-{
-    rcl_ret_t ret = rcl_publish(&publisher, &msg, NULL);
-    msg.data++;
-}
-
-int main()
-{
-    rmw_uros_set_custom_transport(
-        true,
-        NULL,
-        pico_serial_transport_open,
-        pico_serial_transport_close,
-        pico_serial_transport_write,
-        pico_serial_transport_read);
-
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-
-    rcl_timer_t timer;
-    rcl_node_t node;
-    rcl_allocator_t allocator;
-    rclc_support_t support;
-    rclc_executor_t executor;
-
-    allocator = rcl_get_default_allocator();
-
-    // Wait for agent successful ping for 2 minutes.
-    const int timeout_ms = 1000;
-    const uint8_t attempts = 120;
-
-    rcl_ret_t ret = rmw_uros_ping_agent(timeout_ms, attempts);
-
-    if (ret != RCL_RET_OK)
-    {
-        // Unreachable agent, exiting program.
-        return ret;
-    }
-
-    rclc_support_init(&support, 0, NULL, &allocator);
-
-    rclc_node_init_default(&node, "pico_node", "", &support);
-    rclc_publisher_init_default(
-        &publisher,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-        "pico_publisher");
-
-    rclc_timer_init_default(
-        &timer,
-        &support,
-        RCL_MS_TO_NS(1000),
-        timer_callback);
-
-    rclc_executor_init(&executor, &support.context, 1, &allocator);
-    rclc_executor_add_timer(&executor, &timer);
-
-    gpio_put(LED_PIN, 1);
-
-    msg.data = 0;
-    while (true)
-    {
-        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-    }
-    return 0;
-}
-*/
