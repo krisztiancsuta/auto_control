@@ -6,6 +6,12 @@
 !*.md
 !*.txt
 !.gitignore
+!state_space_control/
+!state_space_control/**
+
+# Ignore generated/build artifacts inside Pico module
+state_space_control/build/
+state_space_control/third_party/
 
 # Ignore compiled Python / caches (override the *.py exception)
 __pycache__/
