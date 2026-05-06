@@ -5,6 +5,7 @@
 #include "hardware/pio.h"
 #include "hardware/sync.h"
 #include "pico/stdlib.h"
+#include "hardware/pwm.h"
 #include "pico/time.h"
 #include "pico_uart_transports.h"
 #include "pwm_esc.h"
@@ -30,7 +31,7 @@
 #define WHEEL_RADIUS_M 0.055f
 
 // Reference speed [m/s]. Will be subscribed from ROS 2 if available.
-#define REF_SPEED_MPS_DEFAULT 0.1f
+#define REF_SPEED_MPS_DEFAULT 7.0f
 #define REF_SPEED_TOPIC "ref_speed"
 #define MICRO_ROS_AGENT_PING_TIMEOUT_MS 1000
 #define MICRO_ROS_AGENT_PING_ATTEMPTS 120u
@@ -39,13 +40,15 @@
 #define DEBUG true
 
 // Controller output from Simulink saturation block: [-10, +10] N.
-#define CTRL_FORCE_MIN_N -10.0f
-#define CTRL_FORCE_MAX_N 10.0f
+#define CTRL_FORCE_MIN_N -18.5f
+#define CTRL_FORCE_MAX_N 20.0f
 
 // ESC pulse widths in microseconds (calibrate for your ESC).
-#define ESC_MIN_US 1400u
-#define ESC_NEUTRAL_US 1500u
-#define ESC_MAX_US 1700u
+#define ESC_MIN_US 1100u
+#define ESC_NEUTRAL_US 1300u
+#define ESC_MAX_US 1380u
+#define ESC_DEADZONE_LOW_US 1300u
+#define ESC_DEADZONE_HIGH_US 1300u
 
 static PIO g_pio = pio0;
 static const uint g_sm = 0;
@@ -144,17 +147,15 @@ static inline float clampf(float x, float lo, float hi) {
 }
 
 static inline uint16_t force_to_pwm_us(float force_n) {
-    float normalized = clampf(force_n, CTRL_FORCE_MIN_N, CTRL_FORCE_MAX_N) / CTRL_FORCE_MAX_N;
-
-    if (normalized >= 0.0f) {
-        float span = (float)ESC_MAX_US - (float)ESC_NEUTRAL_US;
-        return (uint16_t)((float)ESC_NEUTRAL_US + normalized * span);
+    if (force_n < 0.0f) {
+        float magnitude = clampf(-force_n / -CTRL_FORCE_MIN_N, 0.0f, 1.0f);
+        float span = (float)ESC_DEADZONE_LOW_US - (float)ESC_MIN_US;
+        return (uint16_t)((float)ESC_DEADZONE_LOW_US - magnitude * span);
     }
 
-    {
-        float span = (float)ESC_NEUTRAL_US - (float)ESC_MIN_US;
-        return (uint16_t)((float)ESC_NEUTRAL_US + normalized * span);
-    }
+    float magnitude = clampf(force_n / CTRL_FORCE_MAX_N, 0.0f, 1.0f);
+    float span = (float)ESC_MAX_US - (float)ESC_DEADZONE_HIGH_US;
+    return (uint16_t)((float)ESC_DEADZONE_HIGH_US + magnitude * span);
 }
 
 static bool control_timer_callback(struct repeating_timer *t) {
@@ -201,7 +202,44 @@ static bool control_timer_callback(struct repeating_timer *t) {
     return true;
 }
 
+void PWM_init(uint8_t pin)
+{
+    gpio_set_function(pin, GPIO_FUNC_PWM);
+
+    uint slice_num = pwm_gpio_to_slice_num(pin);
+    pwm_set_clkdiv(slice_num, 125.0f);
+    pwm_set_wrap(slice_num, 4000);
+    pwm_set_enabled(slice_num, true);
+}
+
+void set_speed(uint16_t m1)
+{
+    uint8_t slice_num = pwm_gpio_to_slice_num(PIN_PWM_ESC);
+    if (1000 <= m1 && m1 <= 2000)
+    {
+        pwm_set_chan_level(slice_num, PWM_CHAN_A, m1);
+    }
+    else
+    {
+        pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
+
+    }
+    return;
+}
+
 int main(void) {
+    /*
+stdio_init_all();
+PWM_init(PIN_PWM_ESC);
+set_speed(1330);
+
+while (true)
+{
+    printf("PWM: %u us\r\n", g_pwm_us);
+    sleep_ms(100);
+}
+
+*/
     stdio_init_all();
     sleep_ms(1200);
 
@@ -243,6 +281,7 @@ int main(void) {
         float speed_mps;
         float force_n;
         float ref_speed;
+        float error_mps;
         uint16_t pwm_us;
         uint32_t last_interval;
         uint32_t callback_count;
@@ -255,6 +294,7 @@ int main(void) {
         speed_mps = g_measured_speed_mps;
         force_n = g_control_force_n;
         ref_speed = g_ref_speed_mps;
+        error_mps = ref_speed - speed_mps;
         pwm_us = g_pwm_us;
         last_interval = g_last_interval_us;
         callback_count = g_callback_count;
@@ -264,17 +304,19 @@ int main(void) {
 
         elapsed_ms = to_ms_since_boot(get_absolute_time());
 
-         printf("elapsed_ms=%lu encoder_count=%ld speed_mps=%.4f force_n=%.4f ref_speed=%.4f pwm_us=%u last_interval=%lu callback_count=%lu min_interval=%lu max_interval=%lu\r\n",
-               (unsigned long)elapsed_ms,
-               (long)encoder_count,
-             (double)speed_mps,
-             (double)force_n,
-             (double)ref_speed,
-             (unsigned int)pwm_us,
-             (unsigned long)last_interval,
-             (unsigned long)callback_count,
-             (unsigned long)min_interval,
-             (unsigned long)max_interval);
+                printf("elapsed_ms=%lu encoder_count=%ld speed_mps=%.4f ref_speed=%.4f error_mps=%.4f force_n=%.4f pwm_us=%u last_interval=%lu callback_count=%lu min_interval=%lu max_interval=%lu\r\n",
+            (unsigned long)elapsed_ms,
+            (long)encoder_count,
+                    (double)speed_mps,
+                    (double)ref_speed,
+                    (double)error_mps,
+                    (double)force_n,
+                    (unsigned int)pwm_us,
+            (unsigned long)last_interval,
+            (unsigned long)callback_count,
+            (unsigned long)min_interval,
+            (unsigned long)max_interval);
         sleep_ms(100);
+
     }
 }

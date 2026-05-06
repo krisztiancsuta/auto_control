@@ -1,3 +1,4 @@
+
 /*
  * Academic License - for use in teaching, academic research, and meeting
  * course requirements at degree granting institutions only.  Not for
@@ -7,9 +8,9 @@
  *
  * Code generated for Simulink model 'state_space_control'.
  *
- * Model version                  : 1.18
+ * Model version                  : 1.20
  * Simulink Coder version         : 24.2 (R2024b) 21-Jun-2024
- * C/C++ source code generated on : Sun Mar 22 09:03:43 2026
+ * C/C++ source code generated on : Wed May  6 11:47:08 2026
  *
  * Target selection: ert.tlc
  * Embedded hardware selection: ARM Compatible->ARM Cortex-M
@@ -48,14 +49,16 @@ void state_space_control_step(void)
    *  Inport: '<Root>/y'
    *  UnitDelay: '<S1>/Unit Delay1'
    */
-  rtb_Sum2_idx_0 = ((0.30119421191220219 * rtDW.UnitDelay1_DSTATE[0] +
-                     0.0016760931138753571 * rtDW.UnitDelay1_DSTATE[1]) +
-                    0.69780013221947257 * rtU.y) + 0.0016760931138753571 *
-    rtb_Gain;
-  rtb_Sum2_idx_1 = ((-36.581731796913274 * rtDW.UnitDelay1_DSTATE[0] +
-                     0.79642906027585081 * rtDW.UnitDelay1_DSTATE[1]) +
-                    36.703874360747768 * rtU.y) + -0.20357093972414919 *
-    rtb_Gain;
+  rtb_Sum2_idx_0 = ((0.83527021141127189 * rtDW.UnitDelay1_DSTATE[0] +
+                     0.0046481326473157532 * rtDW.UnitDelay1_DSTATE[1]) +
+                    0.16194090900033858 * rtU.y) +
+                   0.0046481326473157532 *
+                       rtb_Gain;
+  rtb_Sum2_idx_1 = ((-1.3147667432727737 * rtDW.UnitDelay1_DSTATE[0] +
+                     0.99268355301132349 * rtDW.UnitDelay1_DSTATE[1]) +
+                    1.3191566114659796 * rtU.y) +
+                   -0.007316446988676506 *
+                       rtb_Gain;
 
   /* Sum: '<S1>/Sum1' incorporates:
    *  Gain: '<S1>/Gain'
@@ -63,13 +66,15 @@ void state_space_control_step(void)
    *  Inport: '<Root>/r'
    *  Sum: '<S1>/Sum'
    */
-  rtb_Gain = ((rtU.r - rtb_Sum2_idx_0) * 19.788264106486888 +
-              0.60000000000000853 * rtU.r) - rtb_Sum2_idx_1;
+  rtb_Gain = ((rtU.r - rtb_Sum2_idx_0) * 2.970182503012524 + 0.60000000000000853 * rtU.r) - rtb_Sum2_idx_1;
 
   /* Saturate: '<S1>/Saturation' */
-  if (rtb_Gain > 10.0) {
-    rtb_Gain = 10.0;
-  } else if (rtb_Gain < -10.0) {
+  if (rtb_Gain > 9.0)
+  {
+    rtb_Gain = 9.0;
+  }
+  else if (rtb_Gain < -10.0)
+  {
     rtb_Gain = -10.0;
   }
 
