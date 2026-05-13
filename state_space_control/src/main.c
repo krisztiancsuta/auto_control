@@ -17,6 +17,7 @@
 #include "rmw_microros/rmw_microros.h"
 #include "state_space_control.h"
 #include "std_msgs/msg/float64.h"
+#include "std_msgs/msg/int64.h"
 
 // Base pin for encoder channel A. Channel B must be connected to the next pin.
 #define PIN_AB 2
@@ -29,15 +30,19 @@
 // Tune these constants for your drivetrain/encoder.
 #define ENCODER_COUNTS_PER_REV 127.0f
 #define WHEEL_RADIUS_M 0.055f
+// Gear ratio between encoder-mounted shaft and wheel.
+// Define as shaft revolutions per wheel revolution. For example,
+// a 4:1 gearbox (shaft turns 4 times for one wheel turn) -> 4.0f
+#define GEAR_RATIO_SHAFT_PER_WHEEL 4.0f
 
 // Reference speed [m/s]. Will be subscribed from ROS 2 if available.
-#define REF_SPEED_MPS_DEFAULT 7.0f
+#define REF_SPEED_MPS_DEFAULT 0.0f
 #define REF_SPEED_TOPIC "ref_speed"
 #define MICRO_ROS_AGENT_PING_TIMEOUT_MS 1000
 #define MICRO_ROS_AGENT_PING_ATTEMPTS 120u
 
 // Toggle mode: true = serial debug output, false = micro-ROS node mode.
-#define DEBUG true
+#define DEBUG false
 
 // Controller output from Simulink saturation block: [-10, +10] N.
 #define CTRL_FORCE_MIN_N -18.5f
@@ -79,6 +84,14 @@ static rclc_executor_t g_executor;
 static std_msgs__msg__Float64 g_ref_speed_msg;
 static bool g_micro_ros_connected = false;
 
+/* Publishers for telemetry */
+static rcl_publisher_t g_measured_speed_publisher;
+static rcl_publisher_t g_encoder_count_publisher;
+static rcl_publisher_t g_control_force_publisher;
+static std_msgs__msg__Float64 g_measured_speed_msg;
+static std_msgs__msg__Int64 g_encoder_count_msg;
+static std_msgs__msg__Float64 g_control_force_msg;
+
 static void ref_speed_subscription_callback(const void *msgin) {
     const std_msgs__msg__Float64 *msg = (const std_msgs__msg__Float64 *)msgin;
     uint32_t irq_state = save_and_disable_interrupts();
@@ -111,7 +124,7 @@ static bool micro_ros_init_subscription(void) {
         return false;
     }
 
-    if (rclc_node_init_default(&g_node, "ssc", "", &g_support) != RCL_RET_OK) {
+    if (rclc_node_init_default(&g_node, "state_space_controller", "", &g_support) != RCL_RET_OK) {
         return false;
     }
 
@@ -133,6 +146,31 @@ static bool micro_ros_init_subscription(void) {
             &g_ref_speed_msg,
             ref_speed_subscription_callback,
             ON_NEW_DATA) != RCL_RET_OK) {
+        return false;
+    }
+
+    /* Initialize telemetry publishers */
+    if (rclc_publisher_init_default(
+            &g_measured_speed_publisher,
+            &g_node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64),
+            "measured_speed") != RCL_RET_OK) {
+        return false;
+    }
+
+    if (rclc_publisher_init_default(
+            &g_encoder_count_publisher,
+            &g_node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int64),
+            "encoder_count") != RCL_RET_OK) {
+        return false;
+    }
+
+    if (rclc_publisher_init_default(
+            &g_control_force_publisher,
+            &g_node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64),
+            "control_force") != RCL_RET_OK) {
         return false;
     }
 
@@ -178,7 +216,9 @@ static bool control_timer_callback(struct repeating_timer *t) {
     g_callback_count++;
 
     const float wheel_circumference = 2.0f * PI_F * WHEEL_RADIUS_M;
-    const float meters_per_count = wheel_circumference / ENCODER_COUNTS_PER_REV;
+     /* Account for gearbox: encoder counts are on the shaft. Convert to wheel
+         revolutions by dividing by GEAR_RATIO_SHAFT_PER_WHEEL (shaft revs per wheel rev). */
+     const float meters_per_count = wheel_circumference / (ENCODER_COUNTS_PER_REV * GEAR_RATIO_SHAFT_PER_WHEEL);
 
     int32_t encoder_now = quadrature_encoder_get_count(g_pio, g_sm);
     int32_t delta = encoder_now - g_prev_encoder_count;
@@ -202,44 +242,9 @@ static bool control_timer_callback(struct repeating_timer *t) {
     return true;
 }
 
-void PWM_init(uint8_t pin)
-{
-    gpio_set_function(pin, GPIO_FUNC_PWM);
-
-    uint slice_num = pwm_gpio_to_slice_num(pin);
-    pwm_set_clkdiv(slice_num, 125.0f);
-    pwm_set_wrap(slice_num, 4000);
-    pwm_set_enabled(slice_num, true);
-}
-
-void set_speed(uint16_t m1)
-{
-    uint8_t slice_num = pwm_gpio_to_slice_num(PIN_PWM_ESC);
-    if (1000 <= m1 && m1 <= 2000)
-    {
-        pwm_set_chan_level(slice_num, PWM_CHAN_A, m1);
-    }
-    else
-    {
-        pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
-
-    }
-    return;
-}
 
 int main(void) {
-    /*
-stdio_init_all();
-PWM_init(PIN_PWM_ESC);
-set_speed(1330);
 
-while (true)
-{
-    printf("PWM: %u us\r\n", g_pwm_us);
-    sleep_ms(100);
-}
-
-*/
     stdio_init_all();
     sleep_ms(1200);
 
@@ -273,8 +278,35 @@ while (true)
 
     while (true) {
         if (!DEBUG && g_micro_ros_connected) {
-            (void)rclc_executor_spin_some(&g_executor, RCL_MS_TO_NS(100));
-            continue;
+                (void)rclc_executor_spin_some(&g_executor, RCL_MS_TO_NS(100));
+
+                /* Publish telemetry from shared variables (read under interrupt lock) */
+                uint32_t irq_state_pub = save_and_disable_interrupts();
+                int32_t pub_encoder_count = g_encoder_count;
+                float pub_speed_mps = g_measured_speed_mps;
+                float pub_control_force_n = g_control_force_n;
+                restore_interrupts(irq_state_pub);
+
+                rcl_ret_t pub_rc;
+                g_measured_speed_msg.data = (double)pub_speed_mps;
+                pub_rc = rcl_publish(&g_measured_speed_publisher, &g_measured_speed_msg, NULL);
+                if (pub_rc != RCL_RET_OK) {
+                    //printf("WARN: publish measured_speed failed: %d\r\n", (int)pub_rc);
+                }
+
+                g_control_force_msg.data = (double)pub_control_force_n;
+                pub_rc = rcl_publish(&g_control_force_publisher, &g_control_force_msg, NULL);
+                if (pub_rc != RCL_RET_OK) {
+                    //printf("WARN: publish control_force failed: %d\r\n", (int)pub_rc);
+                }
+
+                g_encoder_count_msg.data = (int64_t)pub_encoder_count;
+                pub_rc = rcl_publish(&g_encoder_count_publisher, &g_encoder_count_msg, NULL);
+                if (pub_rc != RCL_RET_OK) {
+                    //printf("WARN: publish encoder_count failed: %d\r\n", (int)pub_rc);
+                }
+
+                continue;
         }
 
         int32_t encoder_count;
