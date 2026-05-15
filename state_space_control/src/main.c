@@ -1,9 +1,12 @@
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "hardware/pio.h"
 #include "hardware/sync.h"
+#include "pico/stdio.h"
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
 #include "pico/time.h"
@@ -18,6 +21,13 @@
 #include "state_space_control.h"
 #include "std_msgs/msg/float64.h"
 #include "std_msgs/msg/int64.h"
+
+// Set to 1 for USB-serial PWM debug (GPIO 6, any pulse width 0..period at 50 Hz).
+#define PWM_SERIAL_DEBUG_ONLY 1
+
+#if PWM_SERIAL_DEBUG_ONLY && LIB_PICO_STDIO_USB
+#include "pico/stdio_usb.h"
+#endif
 
 // Base pin for encoder channel A. Channel B must be connected to the next pin.
 #define PIN_AB 2
@@ -49,9 +59,11 @@
 #define CTRL_FORCE_MAX_N 20.0f
 
 // ESC pulse widths in microseconds (calibrate for your ESC).
+#if !PWM_SERIAL_DEBUG_ONLY
 #define ESC_MIN_US 1100u
 #define ESC_NEUTRAL_US 1300u
 #define ESC_MAX_US 1380u
+#endif
 #define ESC_DEADZONE_LOW_US 1300u
 #define ESC_DEADZONE_HIGH_US 1300u
 
@@ -67,7 +79,11 @@ static volatile int32_t g_prev_encoder_count = 0;
 static volatile int32_t g_encoder_count = 0;
 static volatile float g_measured_speed_mps = 0.0f;
 static volatile float g_control_force_n = 0.0f;
+#if PWM_SERIAL_DEBUG_ONLY
+static volatile uint16_t g_pwm_us = 0;
+#else
 static volatile uint16_t g_pwm_us = ESC_NEUTRAL_US;
+#endif
 
 // Timing instrumentation for interrupt validation
 static uint32_t g_last_callback_us = 0;
@@ -92,6 +108,78 @@ static std_msgs__msg__Float64 g_measured_speed_msg;
 static std_msgs__msg__Int64 g_encoder_count_msg;
 static std_msgs__msg__Float64 g_control_force_msg;
 
+#if PWM_SERIAL_DEBUG_ONLY
+static bool parse_pwm_us_line(const char *line, uint16_t *out_us, uint32_t max_us) {
+    while (*line != '\0' && isspace((unsigned char)*line)) {
+        line++;
+    }
+
+    if (*line == '\0') {
+        return false;
+    }
+
+    char *end = NULL;
+    long value = strtol(line, &end, 10);
+    if (end == line) {
+        return false;
+    }
+
+    while (*end != '\0' && isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+
+    if (value < 0 || value > (long)max_us) {
+        return false;
+    }
+
+    *out_us = (uint16_t)value;
+    return true;
+}
+
+static void serial_read_line(char *line, size_t line_size) {
+    size_t idx = 0;
+
+    printf("> ");
+    fflush(stdout);
+
+    while (idx + 1 < line_size) {
+        int c = getchar_timeout_us(0);
+        if (c == PICO_ERROR_TIMEOUT) {
+            tight_loop_contents();
+            continue;
+        }
+
+        if (c == '\r' || c == '\n') {
+            line[idx] = '\0';
+            putchar_raw('\n');
+            fflush(stdout);
+            return;
+        }
+
+        if (c == 127 || c == 8) {
+            if (idx > 0) {
+                idx--;
+                printf("\b \b");
+                fflush(stdout);
+            }
+            continue;
+        }
+
+        if (c >= ' ' && c <= '~') {
+            line[idx++] = (char)c;
+            putchar_raw((char)c);
+            fflush(stdout);
+        }
+    }
+
+    line[line_size - 1] = '\0';
+}
+#endif
+
+#if !PWM_SERIAL_DEBUG_ONLY
 static void ref_speed_subscription_callback(const void *msgin) {
     const std_msgs__msg__Float64 *msg = (const std_msgs__msg__Float64 *)msgin;
     uint32_t irq_state = save_and_disable_interrupts();
@@ -241,6 +329,7 @@ static bool control_timer_callback(struct repeating_timer *t) {
 
     return true;
 }
+#endif
 
 
 int main(void) {
@@ -248,6 +337,47 @@ int main(void) {
     stdio_init_all();
     sleep_ms(1200);
 
+#if PWM_SERIAL_DEBUG_ONLY
+    setbuf(stdout, NULL);
+
+#if LIB_PICO_STDIO_USB
+    printf("Waiting for USB serial...\r\n");
+    fflush(stdout);
+    while (!stdio_usb_connected()) {
+        sleep_ms(100);
+    }
+#endif
+    sleep_ms(500);
+
+    const uint32_t pwm_period_us = pwm_esc_pwm_period_us();
+    const uint32_t pwm_hz = pwm_esc_pwm_frequency_hz();
+
+    printf("PWM serial debug: %lu Hz on GPIO %u\r\n",
+           (unsigned long)pwm_hz, (unsigned int)PIN_PWM_ESC);
+    printf("Send high-time 0-%lu us, then Enter\r\n", (unsigned long)pwm_period_us);
+
+    pwm_esc_init(&g_esc, PIN_PWM_ESC, 0u, (uint16_t)(pwm_period_us / 2u),
+                 (uint16_t)pwm_period_us);
+    printf("Initial pwm_us=%u\r\n", (unsigned int)pwm_esc_get_current_us(&g_esc));
+    fflush(stdout);
+
+    char line[32];
+    while (true) {
+        serial_read_line(line, sizeof(line));
+
+        uint16_t pwm_us;
+        if (!parse_pwm_us_line(line, &pwm_us, pwm_period_us)) {
+            printf("ERR: send integer 0-%lu\r\n", (unsigned long)pwm_period_us);
+            fflush(stdout);
+            continue;
+        }
+
+        pwm_esc_set_speed_us(&g_esc, pwm_us);
+        printf("OK pwm_us=%u\r\n", (unsigned int)pwm_esc_get_current_us(&g_esc));
+        fflush(stdout);
+    }
+
+#else
     printf("State-space speed control at 50 Hz\r\n");
 
     pio_add_program(g_pio, &quadrature_encoder_program);
@@ -351,4 +481,5 @@ int main(void) {
         sleep_ms(100);
 
     }
+#endif
 }

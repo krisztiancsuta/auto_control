@@ -4,12 +4,13 @@
 #include "hardware/clocks.h"
 #include <math.h>
 
-/* PWM configuration for ESC control
- * Standard ESC expects 50Hz frequency (20ms period)
- * Pulse width: 1000-2000 microseconds
- */
-#define ESC_PWM_FREQUENCY 50  // Hz
-#define ESC_PWM_PERIOD_US 20000  // microseconds (1/50Hz)
+/* PWM frame rate and period (1 MHz counter: pulse_us must be <= period) */
+#define ESC_PWM_FREQUENCY_HZ 50u
+#define ESC_PWM_PERIOD_US (1000000u / ESC_PWM_FREQUENCY_HZ)
+
+/* NPN transistor inverts the GPIO signal; invert PWM output so the load sees
+ * the requested high-time pulse width (1000-2000 us). */
+#define ESC_PWM_INVERT_OUTPUT 1
 
 static inline uint32_t clamp_uint32(uint32_t value, uint32_t min, uint32_t max) {
     if (value < min) return min;
@@ -32,7 +33,8 @@ void pwm_esc_init(pwm_esc_t *esc, uint8_t gpio_pin,
     esc->nominal_us = nominal_us;
     esc->max_us = max_us;
     esc->current_us = nominal_us;
-    
+    esc->period_us = (uint16_t)ESC_PWM_PERIOD_US;
+
     // Determine PWM slice and channel from GPIO pin
     esc->pwm_slice = pwm_gpio_to_slice_num(gpio_pin);
     esc->pwm_channel = pwm_gpio_to_channel(gpio_pin);
@@ -40,35 +42,24 @@ void pwm_esc_init(pwm_esc_t *esc, uint8_t gpio_pin,
     // Enable PWM on the GPIO pin
     gpio_set_function(gpio_pin, GPIO_FUNC_PWM);
     
-    // Configure PWM
-    // Clock frequency: 125MHz (standard Pico)
-    // We need 50Hz frequency with 16-bit resolution
-    // Wrap value determines the period
-    // Period = (wrap + 1) * clock_div / clock_freq
-    // For 50Hz: 20000us = (wrap + 1) * clock_div / 125MHz
-    
-    uint32_t clock_freq = clock_get_hz(clk_sys);  // 125MHz
-    
-    // Calculate wrap and clock divisor
-    // We want: period = (wrap + 1) * clock_div / 125MHz = 20000us
-    // Let's use clock_div = 25, then:
-    // 20000us = (wrap + 1) * 25 / 125MHz
-    // wrap + 1 = 20000 * 125MHz / (25 * 1000000) = 100000
-    // wrap = 99999
-    
-    // But that's too large for 16-bit. Let's use different approach:
-    // clock_div = 125 gives us: period = (wrap + 1) * 125 / 125MHz = (wrap + 1) / 1MHz
-    // For 20000us: wrap + 1 = 20000, so wrap = 19999
-    
-    uint16_t wrap = 19999;  // 20000 ticks at 1MHz = 20000us
-    float clock_div = (float)clock_freq / 1000000.0f;  // 125MHz / 1MHz = 125
+    // Configure PWM: 1 MHz counter tick -> period_us = wrap + 1
+    uint32_t clock_freq = clock_get_hz(clk_sys);
+    uint32_t period_us = ESC_PWM_PERIOD_US;
+    uint16_t wrap = (uint16_t)(period_us - 1u);
+    float clock_div = (float)clock_freq / 1000000.0f;
     
     pwm_config cfg = pwm_get_default_config();
     pwm_config_set_clkdiv(&cfg, clock_div);
     pwm_config_set_wrap(&cfg, wrap);
     
     pwm_init(esc->pwm_slice, &cfg, true);
-    
+
+#if ESC_PWM_INVERT_OUTPUT
+    pwm_set_output_polarity(esc->pwm_slice,
+                            esc->pwm_channel == PWM_CHAN_A,
+                            esc->pwm_channel == PWM_CHAN_B);
+#endif
+
     // Set initial speed
     pwm_esc_set_speed_us(esc, nominal_us);
 }
@@ -94,18 +85,25 @@ void pwm_esc_set_speed(pwm_esc_t *esc, float speed) {
     pwm_esc_set_speed_us(esc, pulse_us);
 }
 
+uint32_t pwm_esc_pwm_frequency_hz(void) {
+    return ESC_PWM_FREQUENCY_HZ;
+}
+
+uint32_t pwm_esc_pwm_period_us(void) {
+    return ESC_PWM_PERIOD_US;
+}
+
 void pwm_esc_set_speed_us(pwm_esc_t *esc, uint16_t pulse_us) {
-    // Clamp to valid range
-    pulse_us = (uint16_t)clamp_uint32(pulse_us, esc->min_us, esc->max_us);
+    uint32_t max_allowed = esc->max_us;
+    if (max_allowed > esc->period_us) {
+        max_allowed = esc->period_us;
+    }
+    pulse_us = (uint16_t)clamp_uint32(pulse_us, esc->min_us, max_allowed);
     esc->current_us = pulse_us;
     
-    // Convert microseconds to PWM counter level
-    // PWM runs at 1MHz (with our clock_div=125)
-    // So 1 microsecond = 1 counter unit
-    uint16_t level = pulse_us;
-    
-    // Set the PWM level (duty cycle)
-    pwm_set_chan_level(esc->pwm_slice, esc->pwm_channel, level);
+    // 1 MHz counter: compare value equals requested high-time at the load
+    // (GPIO polarity is inverted in init when ESC_PWM_INVERT_OUTPUT is set).
+    pwm_set_chan_level(esc->pwm_slice, esc->pwm_channel, pulse_us);
 }
 
 uint16_t pwm_esc_get_current_us(pwm_esc_t *esc) {

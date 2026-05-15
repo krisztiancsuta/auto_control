@@ -21,7 +21,8 @@ typedef struct {
     uint16_t min_us;            // Minimum PWM pulse width in microseconds (default: 1000)
     uint16_t nominal_us;        // Nominal PWM pulse width in microseconds (default: 1500)
     uint16_t max_us;            // Maximum PWM pulse width in microseconds (default: 2000)
-    
+    uint16_t period_us;         // PWM period in microseconds (set at init)
+
     uint16_t current_us;        // Current PWM pulse width in microseconds
 } pwm_esc_t;
 
@@ -35,10 +36,13 @@ typedef struct {
  * @param max_us Maximum speed pulse width (microseconds)
  * 
  * Default parameters: min=1000, nominal=1500, max=2000
- * PWM frequency is set to 50Hz (20ms period) for ESC compatibility
+ * PWM frequency is 50 Hz (20 ms period). Output is polarity-inverted for an NPN driver.
  */
 void pwm_esc_init(pwm_esc_t *esc, uint8_t gpio_pin, 
                   uint16_t min_us, uint16_t nominal_us, uint16_t max_us);
+
+uint32_t pwm_esc_pwm_frequency_hz(void);
+uint32_t pwm_esc_pwm_period_us(void);
 
 /**
  * Set ESC speed using normalized value (-1.0 to 1.0).

@@ -18,36 +18,57 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
+option(PWM_DEBUG_BUILD "Build serial PWM debug firmware (GPIO 6, 1000-2000 us)" OFF)
+
 set(MICRO_ROS_DIR ${CMAKE_CURRENT_LIST_DIR}/third_party/micro_ros_raspberrypi_pico_sdk)
 
-link_directories(${MICRO_ROS_DIR}/libmicroros)
+if(PWM_DEBUG_BUILD)
+    add_executable(pio_quadrature_encoder
+        src/main_debug.c
+        src/pwm_esc.c
+    )
+else()
+    link_directories(${MICRO_ROS_DIR}/libmicroros)
 
-add_executable(pio_quadrature_encoder
-    src/main.c
-    src/pwm_esc.c
-    src/state_space_control.c
-    ${MICRO_ROS_DIR}/pico_uart_transport.c
-)
+    add_executable(pio_quadrature_encoder
+        src/main.c
+        src/pwm_esc.c
+        src/state_space_control.c
+        ${MICRO_ROS_DIR}/pico_uart_transport.c
+    )
+endif()
 
-pico_generate_pio_header(pio_quadrature_encoder
-    ${CMAKE_CURRENT_LIST_DIR}/src/quadrature_encoder.pio
-)
+if(NOT PWM_DEBUG_BUILD)
+    pico_generate_pio_header(pio_quadrature_encoder
+        ${CMAKE_CURRENT_LIST_DIR}/src/quadrature_encoder.pio
+    )
+endif()
 
 target_include_directories(pio_quadrature_encoder PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src
-    ${MICRO_ROS_DIR}
-    ${MICRO_ROS_DIR}/libmicroros/include
 )
+
+if(NOT PWM_DEBUG_BUILD)
+    target_include_directories(pio_quadrature_encoder PRIVATE
+        ${MICRO_ROS_DIR}
+        ${MICRO_ROS_DIR}/libmicroros/include
+    )
+endif()
 
 target_link_libraries(pio_quadrature_encoder
     pico_stdlib
     pico_multicore
     hardware_gpio
-    hardware_pio
     hardware_pwm
     hardware_clocks
-    microros
 )
+
+if(NOT PWM_DEBUG_BUILD)
+    target_link_libraries(pio_quadrature_encoder
+        hardware_pio
+        microros
+    )
+endif()
 
 target_compile_options(pio_quadrature_encoder PRIVATE
     -ffunction-sections
