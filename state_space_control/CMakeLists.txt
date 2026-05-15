@@ -26,6 +26,7 @@ if(PWM_DEBUG_BUILD)
     add_executable(pio_quadrature_encoder
         src/main_debug.c
         src/pwm_esc.c
+        src/serial_cli.c
     )
 else()
     link_directories(${MICRO_ROS_DIR}/libmicroros)
@@ -33,6 +34,7 @@ else()
     add_executable(pio_quadrature_encoder
         src/main.c
         src/pwm_esc.c
+        src/serial_cli.c
         src/state_space_control.c
         ${MICRO_ROS_DIR}/pico_uart_transport.c
     )

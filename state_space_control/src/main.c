@@ -1,20 +1,15 @@
-
-#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
-#include <stdlib.h>
 
+#include "config.h"
 #include "hardware/pio.h"
 #include "hardware/sync.h"
-#include "pico/stdio.h"
 #include "pico/stdlib.h"
-#include "hardware/pwm.h"
 #include "pico/time.h"
 #include "pico_uart_transports.h"
 #include "pwm_esc.h"
 #include "quadrature_encoder.pio.h"
 #include "rcl/rcl.h"
-#include "rcl/error_handling.h"
 #include "rclc/executor.h"
 #include "rclc/rclc.h"
 #include "rmw_microros/rmw_microros.h"
@@ -22,59 +17,19 @@
 #include "std_msgs/msg/float64.h"
 #include "std_msgs/msg/int64.h"
 
-// Set to 1 for USB-serial PWM debug (GPIO 6, any pulse width 0..period at 50 Hz).
-#define PWM_SERIAL_DEBUG_ONLY 1
-
-#if PWM_SERIAL_DEBUG_ONLY && LIB_PICO_STDIO_USB
+#if PWM_SERIAL_DEBUG_ONLY
+#include "serial_cli.h"
+#if LIB_PICO_STDIO_USB
 #include "pico/stdio_usb.h"
 #endif
-
-// Base pin for encoder channel A. Channel B must be connected to the next pin.
-#define PIN_AB 2
-#define PIN_PWM_ESC 6
-
-#define CONTROL_PERIOD_MS 20
-#define CONTROL_DT_S 0.02f
-#define PI_F 3.14159265358979323846f
-
-// Tune these constants for your drivetrain/encoder.
-#define ENCODER_COUNTS_PER_REV 127.0f
-#define WHEEL_RADIUS_M 0.055f
-// Gear ratio between encoder-mounted shaft and wheel.
-// Define as shaft revolutions per wheel revolution. For example,
-// a 4:1 gearbox (shaft turns 4 times for one wheel turn) -> 4.0f
-#define GEAR_RATIO_SHAFT_PER_WHEEL 4.0f
-
-// Reference speed [m/s]. Will be subscribed from ROS 2 if available.
-#define REF_SPEED_MPS_DEFAULT 0.0f
-#define REF_SPEED_TOPIC "ref_speed"
-#define MICRO_ROS_AGENT_PING_TIMEOUT_MS 1000
-#define MICRO_ROS_AGENT_PING_ATTEMPTS 120u
-
-// Toggle mode: true = serial debug output, false = micro-ROS node mode.
-#define DEBUG false
-
-// Controller output from Simulink saturation block: [-10, +10] N.
-#define CTRL_FORCE_MIN_N -18.5f
-#define CTRL_FORCE_MAX_N 20.0f
-
-// ESC pulse widths in microseconds (calibrate for your ESC).
-#if !PWM_SERIAL_DEBUG_ONLY
-#define ESC_MIN_US 1100u
-#define ESC_NEUTRAL_US 1300u
-#define ESC_MAX_US 1380u
 #endif
-#define ESC_DEADZONE_LOW_US 1300u
-#define ESC_DEADZONE_HIGH_US 1300u
 
 static PIO g_pio = pio0;
 static const uint g_sm = 0;
 static pwm_esc_t g_esc;
 static struct repeating_timer g_control_timer;
 
-// Reference speed [m/s] - shared between ROS 2 subscription and control loop
 static volatile float g_ref_speed_mps = REF_SPEED_MPS_DEFAULT;
-
 static volatile int32_t g_prev_encoder_count = 0;
 static volatile int32_t g_encoder_count = 0;
 static volatile float g_measured_speed_mps = 0.0f;
@@ -85,7 +40,6 @@ static volatile uint16_t g_pwm_us = 0;
 static volatile uint16_t g_pwm_us = ESC_NEUTRAL_US;
 #endif
 
-// Timing instrumentation for interrupt validation
 static uint32_t g_last_callback_us = 0;
 static volatile uint32_t g_last_interval_us = 0;
 static volatile uint32_t g_callback_count = 0;
@@ -100,7 +54,6 @@ static rclc_executor_t g_executor;
 static std_msgs__msg__Float64 g_ref_speed_msg;
 static bool g_micro_ros_connected = false;
 
-/* Publishers for telemetry */
 static rcl_publisher_t g_measured_speed_publisher;
 static rcl_publisher_t g_encoder_count_publisher;
 static rcl_publisher_t g_control_force_publisher;
@@ -108,78 +61,12 @@ static std_msgs__msg__Float64 g_measured_speed_msg;
 static std_msgs__msg__Int64 g_encoder_count_msg;
 static std_msgs__msg__Float64 g_control_force_msg;
 
-#if PWM_SERIAL_DEBUG_ONLY
-static bool parse_pwm_us_line(const char *line, uint16_t *out_us, uint32_t max_us) {
-    while (*line != '\0' && isspace((unsigned char)*line)) {
-        line++;
-    }
-
-    if (*line == '\0') {
-        return false;
-    }
-
-    char *end = NULL;
-    long value = strtol(line, &end, 10);
-    if (end == line) {
-        return false;
-    }
-
-    while (*end != '\0' && isspace((unsigned char)*end)) {
-        end++;
-    }
-    if (*end != '\0') {
-        return false;
-    }
-
-    if (value < 0 || value > (long)max_us) {
-        return false;
-    }
-
-    *out_us = (uint16_t)value;
-    return true;
-}
-
-static void serial_read_line(char *line, size_t line_size) {
-    size_t idx = 0;
-
-    printf("> ");
-    fflush(stdout);
-
-    while (idx + 1 < line_size) {
-        int c = getchar_timeout_us(0);
-        if (c == PICO_ERROR_TIMEOUT) {
-            tight_loop_contents();
-            continue;
-        }
-
-        if (c == '\r' || c == '\n') {
-            line[idx] = '\0';
-            putchar_raw('\n');
-            fflush(stdout);
-            return;
-        }
-
-        if (c == 127 || c == 8) {
-            if (idx > 0) {
-                idx--;
-                printf("\b \b");
-                fflush(stdout);
-            }
-            continue;
-        }
-
-        if (c >= ' ' && c <= '~') {
-            line[idx++] = (char)c;
-            putchar_raw((char)c);
-            fflush(stdout);
-        }
-    }
-
-    line[line_size - 1] = '\0';
-}
-#endif
-
 #if !PWM_SERIAL_DEBUG_ONLY
+static void ros_publish(const rcl_publisher_t *publisher, const void *msg) {
+    rcl_ret_t rc = rcl_publish(publisher, msg, NULL);
+    (void)rc;
+}
+
 static void ref_speed_subscription_callback(const void *msgin) {
     const std_msgs__msg__Float64 *msg = (const std_msgs__msg__Float64 *)msgin;
     uint32_t irq_state = save_and_disable_interrupts();
@@ -189,13 +76,11 @@ static void ref_speed_subscription_callback(const void *msgin) {
 
 static bool micro_ros_init_subscription(void) {
     rmw_uros_set_custom_transport(
-        true,
-        NULL,
+        true, NULL,
         pico_serial_transport_open,
         pico_serial_transport_close,
         pico_serial_transport_write,
-        pico_serial_transport_read
-    );
+        pico_serial_transport_read);
 
     if (rmw_uros_ping_agent(MICRO_ROS_AGENT_PING_TIMEOUT_MS, MICRO_ROS_AGENT_PING_ATTEMPTS) != RCL_RET_OK) {
         return false;
@@ -211,54 +96,39 @@ static bool micro_ros_init_subscription(void) {
     if (rclc_support_init(&g_support, 0, NULL, &g_allocator) != RCL_RET_OK) {
         return false;
     }
-
     if (rclc_node_init_default(&g_node, "state_space_controller", "", &g_support) != RCL_RET_OK) {
         return false;
     }
-
     if (rclc_subscription_init_default(
-            &g_ref_speed_subscription,
-            &g_node,
+            &g_ref_speed_subscription, &g_node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64),
             REF_SPEED_TOPIC) != RCL_RET_OK) {
         return false;
     }
-
     if (rclc_executor_init(&g_executor, &g_support.context, 1, &g_allocator) != RCL_RET_OK) {
         return false;
     }
-
     if (rclc_executor_add_subscription(
-            &g_executor,
-            &g_ref_speed_subscription,
-            &g_ref_speed_msg,
-            ref_speed_subscription_callback,
-            ON_NEW_DATA) != RCL_RET_OK) {
+            &g_executor, &g_ref_speed_subscription, &g_ref_speed_msg,
+            ref_speed_subscription_callback, ON_NEW_DATA) != RCL_RET_OK) {
         return false;
     }
-
-    /* Initialize telemetry publishers */
     if (rclc_publisher_init_default(
-            &g_measured_speed_publisher,
-            &g_node,
+            &g_measured_speed_publisher, &g_node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64),
-            "measured_speed") != RCL_RET_OK) {
+            MEASURED_SPEED_TOPIC) != RCL_RET_OK) {
         return false;
     }
-
     if (rclc_publisher_init_default(
-            &g_encoder_count_publisher,
-            &g_node,
+            &g_encoder_count_publisher, &g_node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int64),
-            "encoder_count") != RCL_RET_OK) {
+            ENCODER_COUNT_TOPIC) != RCL_RET_OK) {
         return false;
     }
-
     if (rclc_publisher_init_default(
-            &g_control_force_publisher,
-            &g_node,
+            &g_control_force_publisher, &g_node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64),
-            "control_force") != RCL_RET_OK) {
+            CONTROL_FORCE_TOPIC) != RCL_RET_OK) {
         return false;
     }
 
@@ -267,8 +137,12 @@ static bool micro_ros_init_subscription(void) {
 }
 
 static inline float clampf(float x, float lo, float hi) {
-    if (x < lo) return lo;
-    if (x > hi) return hi;
+    if (x < lo) {
+        return lo;
+    }
+    if (x > hi) {
+        return hi;
+    }
     return x;
 }
 
@@ -287,12 +161,10 @@ static inline uint16_t force_to_pwm_us(float force_n) {
 static bool control_timer_callback(struct repeating_timer *t) {
     (void)t;
 
-    // Measure timing
     uint32_t now_us = time_us_32();
     if (g_last_callback_us != 0) {
         uint32_t interval_us = now_us - g_last_callback_us;
         g_last_interval_us = interval_us;
-
         if (interval_us < g_min_interval_us) {
             g_min_interval_us = interval_us;
         }
@@ -304,9 +176,8 @@ static bool control_timer_callback(struct repeating_timer *t) {
     g_callback_count++;
 
     const float wheel_circumference = 2.0f * PI_F * WHEEL_RADIUS_M;
-     /* Account for gearbox: encoder counts are on the shaft. Convert to wheel
-         revolutions by dividing by GEAR_RATIO_SHAFT_PER_WHEEL (shaft revs per wheel rev). */
-     const float meters_per_count = wheel_circumference / (ENCODER_COUNTS_PER_REV * GEAR_RATIO_SHAFT_PER_WHEEL);
+    const float meters_per_count =
+        wheel_circumference / (ENCODER_COUNTS_PER_REV * GEAR_RATIO_SHAFT_PER_WHEEL);
 
     int32_t encoder_now = quadrature_encoder_get_count(g_pio, g_sm);
     int32_t delta = encoder_now - g_prev_encoder_count;
@@ -331,59 +202,51 @@ static bool control_timer_callback(struct repeating_timer *t) {
 }
 #endif
 
-
 int main(void) {
-
-    stdio_init_all();
-    sleep_ms(1200);
-
 #if PWM_SERIAL_DEBUG_ONLY
-    setbuf(stdout, NULL);
-
-#if LIB_PICO_STDIO_USB
+    serial_stdio_setup();
     printf("Waiting for USB serial...\r\n");
     fflush(stdout);
-    while (!stdio_usb_connected()) {
-        sleep_ms(100);
-    }
-#endif
-    sleep_ms(500);
+    serial_wait_usb();
 
-    const uint32_t pwm_period_us = pwm_esc_pwm_period_us();
-    const uint32_t pwm_hz = pwm_esc_pwm_frequency_hz();
+    printf("PWM serial debug: %lu Hz, GPIO %u\r\n",
+           (unsigned long)pwm_esc_pwm_frequency_hz(), (unsigned int)PIN_PWM_ESC);
+    printf("High-time %u-%u us, then Enter\r\n",
+           (unsigned int)PWM_SERIAL_DEBUG_MIN_US, (unsigned int)PWM_SERIAL_DEBUG_MAX_US);
 
-    printf("PWM serial debug: %lu Hz on GPIO %u\r\n",
-           (unsigned long)pwm_hz, (unsigned int)PIN_PWM_ESC);
-    printf("Send high-time 0-%lu us, then Enter\r\n", (unsigned long)pwm_period_us);
+    pwm_esc_init(&g_esc, PIN_PWM_ESC, PWM_SERIAL_DEBUG_MIN_US, PWM_SERIAL_DEBUG_NEUTRAL_US,
+                 PWM_SERIAL_DEBUG_MAX_US);
 
-    pwm_esc_init(&g_esc, PIN_PWM_ESC, 0u, (uint16_t)(pwm_period_us / 2u),
-                 (uint16_t)pwm_period_us);
-    printf("Initial pwm_us=%u\r\n", (unsigned int)pwm_esc_get_current_us(&g_esc));
-    fflush(stdout);
-
-    char line[32];
+    char line[SERIAL_LINE_BUF_SIZE];
     while (true) {
         serial_read_line(line, sizeof(line));
-
         uint16_t pwm_us;
-        if (!parse_pwm_us_line(line, &pwm_us, pwm_period_us)) {
-            printf("ERR: send integer 0-%lu\r\n", (unsigned long)pwm_period_us);
+        if (!serial_parse_pulse_us(line, &pwm_us, PWM_SERIAL_DEBUG_MIN_US,
+                                   PWM_SERIAL_DEBUG_MAX_US)) {
+            printf("ERR: integer %u-%u\r\n",
+                   (unsigned int)PWM_SERIAL_DEBUG_MIN_US, (unsigned int)PWM_SERIAL_DEBUG_MAX_US);
             fflush(stdout);
             continue;
         }
-
         pwm_esc_set_speed_us(&g_esc, pwm_us);
         printf("OK pwm_us=%u\r\n", (unsigned int)pwm_esc_get_current_us(&g_esc));
         fflush(stdout);
     }
-
 #else
-    printf("State-space speed control at 50 Hz\r\n");
+    stdio_init_all();
+    sleep_ms(USB_SERIAL_BOOT_DELAY_MS);
+
+    printf("Control %d Hz, ESC PWM %lu Hz, GPIO %u (NPN)\r\n",
+           1000 / CONTROL_PERIOD_MS,
+           (unsigned long)pwm_esc_pwm_frequency_hz(),
+           (unsigned int)PIN_PWM_ESC);
 
     pio_add_program(g_pio, &quadrature_encoder_program);
-    quadrature_encoder_program_init(g_pio, g_sm, PIN_AB, 0);
+    quadrature_encoder_program_init(g_pio, g_sm, PIN_ENCODER_AB, 0);
 
     pwm_esc_init(&g_esc, PIN_PWM_ESC, ESC_MIN_US, ESC_NEUTRAL_US, ESC_MAX_US);
+    printf("ESC %u-%u us (neutral %u)\r\n",
+           (unsigned int)ESC_MIN_US, (unsigned int)ESC_MAX_US, (unsigned int)ESC_NEUTRAL_US);
 
     state_space_control_initialize();
 
@@ -391,52 +254,37 @@ int main(void) {
     g_encoder_count = g_prev_encoder_count;
 
     if (!add_repeating_timer_ms(-CONTROL_PERIOD_MS, control_timer_callback, NULL, &g_control_timer)) {
-        printf("ERROR: failed to start 20 ms control timer\r\n");
+        printf("ERROR: control timer failed\r\n");
         while (true) {
             tight_loop_contents();
         }
     }
 
-    printf("Using default reference speed: %.2f m/s\r\n", REF_SPEED_MPS_DEFAULT);
+    printf("Default ref speed %.2f m/s\r\n", REF_SPEED_MPS_DEFAULT);
 
-    if (DEBUG) {
-        printf("DEBUG=true -> serial mode\r\n");
-        printf("Printing: elapsed_ms, encoder_count, speed_mps, force_n, ref_speed, pwm_us, last_interval, callback_count, min_interval, max_interval\r\n");
+    if (!ROS_MODE) {
+        printf("Serial telemetry mode\r\n");
     } else if (!micro_ros_init_subscription()) {
-        printf("micro-ROS agent not reachable, continuing with serial status output\r\n");
+        printf("micro-ROS unavailable, serial telemetry fallback\r\n");
     }
 
     while (true) {
-        if (!DEBUG && g_micro_ros_connected) {
-                (void)rclc_executor_spin_some(&g_executor, RCL_MS_TO_NS(100));
+        if (ROS_MODE && g_micro_ros_connected) {
+            (void)rclc_executor_spin_some(&g_executor, RCL_MS_TO_NS(100));
 
-                /* Publish telemetry from shared variables (read under interrupt lock) */
-                uint32_t irq_state_pub = save_and_disable_interrupts();
-                int32_t pub_encoder_count = g_encoder_count;
-                float pub_speed_mps = g_measured_speed_mps;
-                float pub_control_force_n = g_control_force_n;
-                restore_interrupts(irq_state_pub);
+            uint32_t irq_state_pub = save_and_disable_interrupts();
+            int32_t pub_encoder_count = g_encoder_count;
+            float pub_speed_mps = g_measured_speed_mps;
+            float pub_control_force_n = g_control_force_n;
+            restore_interrupts(irq_state_pub);
 
-                rcl_ret_t pub_rc;
-                g_measured_speed_msg.data = (double)pub_speed_mps;
-                pub_rc = rcl_publish(&g_measured_speed_publisher, &g_measured_speed_msg, NULL);
-                if (pub_rc != RCL_RET_OK) {
-                    //printf("WARN: publish measured_speed failed: %d\r\n", (int)pub_rc);
-                }
-
-                g_control_force_msg.data = (double)pub_control_force_n;
-                pub_rc = rcl_publish(&g_control_force_publisher, &g_control_force_msg, NULL);
-                if (pub_rc != RCL_RET_OK) {
-                    //printf("WARN: publish control_force failed: %d\r\n", (int)pub_rc);
-                }
-
-                g_encoder_count_msg.data = (int64_t)pub_encoder_count;
-                pub_rc = rcl_publish(&g_encoder_count_publisher, &g_encoder_count_msg, NULL);
-                if (pub_rc != RCL_RET_OK) {
-                    //printf("WARN: publish encoder_count failed: %d\r\n", (int)pub_rc);
-                }
-
-                continue;
+            g_measured_speed_msg.data = (double)pub_speed_mps;
+            ros_publish(&g_measured_speed_publisher, &g_measured_speed_msg);
+            g_control_force_msg.data = (double)pub_control_force_n;
+            ros_publish(&g_control_force_publisher, &g_control_force_msg);
+            g_encoder_count_msg.data = (int64_t)pub_encoder_count;
+            ros_publish(&g_encoder_count_publisher, &g_encoder_count_msg);
+            continue;
         }
 
         int32_t encoder_count;
@@ -465,21 +313,14 @@ int main(void) {
         restore_interrupts(irq_state);
 
         elapsed_ms = to_ms_since_boot(get_absolute_time());
-
-                printf("elapsed_ms=%lu encoder_count=%ld speed_mps=%.4f ref_speed=%.4f error_mps=%.4f force_n=%.4f pwm_us=%u last_interval=%lu callback_count=%lu min_interval=%lu max_interval=%lu\r\n",
-            (unsigned long)elapsed_ms,
-            (long)encoder_count,
-                    (double)speed_mps,
-                    (double)ref_speed,
-                    (double)error_mps,
-                    (double)force_n,
-                    (unsigned int)pwm_us,
-            (unsigned long)last_interval,
-            (unsigned long)callback_count,
-            (unsigned long)min_interval,
-            (unsigned long)max_interval);
+        printf("elapsed_ms=%lu encoder_count=%ld speed_mps=%.4f ref_speed=%.4f error_mps=%.4f "
+               "force_n=%.4f pwm_us=%u last_interval=%lu callback_count=%lu min_interval=%lu "
+               "max_interval=%lu\r\n",
+               (unsigned long)elapsed_ms, (long)encoder_count, (double)speed_mps,
+               (double)ref_speed, (double)error_mps, (double)force_n, (unsigned int)pwm_us,
+               (unsigned long)last_interval, (unsigned long)callback_count,
+               (unsigned long)min_interval, (unsigned long)max_interval);
         sleep_ms(100);
-
     }
 #endif
 }
