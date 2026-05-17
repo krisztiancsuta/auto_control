@@ -11,7 +11,7 @@
 #define PWM_SERIAL_DEBUG_NEUTRAL_US 1500u
 
 #define PIN_ENCODER_AB 2u
-#define PIN_PWM_ESC 6u
+#define PIN_PWM_ESC 9u
 
 #define CONTROL_PERIOD_MS 20
 #define CONTROL_DT_S 0.02f

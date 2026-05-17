@@ -18,7 +18,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-option(PWM_DEBUG_BUILD "Build serial PWM debug firmware (GPIO 6, 1000-2000 us)" OFF)
+option(PWM_DEBUG_BUILD "Build serial PWM debug firmware (GPIO 9, 1000-2000 us)" OFF)
 
 set(MICRO_ROS_DIR ${CMAKE_CURRENT_LIST_DIR}/third_party/micro_ros_raspberrypi_pico_sdk)
 
