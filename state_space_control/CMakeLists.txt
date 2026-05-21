@@ -36,7 +36,7 @@ else()
         src/pwm_esc.c
         src/serial_cli.c
         src/state_space_control.c
-        ${MICRO_ROS_DIR}/pico_uart_transport.c
+        src/pico_uart_transport.c
     )
 endif()
 
@@ -68,6 +68,7 @@ target_link_libraries(pio_quadrature_encoder
 if(NOT PWM_DEBUG_BUILD)
     target_link_libraries(pio_quadrature_encoder
         hardware_pio
+        hardware_uart
         microros
     )
 endif()

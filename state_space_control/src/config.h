@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define PWM_SERIAL_DEBUG_ONLY 1
+#define PWM_SERIAL_DEBUG_ONLY 0
 
 #define PWM_SERIAL_DEBUG_MIN_US 1000u
 #define PWM_SERIAL_DEBUG_MAX_US 2000u
@@ -21,7 +21,7 @@
 #define WHEEL_RADIUS_M 0.055f
 #define GEAR_RATIO_SHAFT_PER_WHEEL 4.0f
 
-#define REF_SPEED_MPS_DEFAULT 10.0f
+#define REF_SPEED_MPS_DEFAULT 0.0f
 
 #define REF_SPEED_TOPIC "ref_speed"
 #define MEASURED_SPEED_TOPIC "measured_speed"
@@ -31,20 +31,25 @@
 #define MICRO_ROS_AGENT_PING_TIMEOUT_MS 1000
 #define MICRO_ROS_AGENT_PING_ATTEMPTS 120u
 
-/* true: micro-ROS; false: USB serial telemetry only */
-#define ROS_MODE false
+/* UART0: GP0 = TX, GP1 = RX (connect agent to these pins, not USB) */
+#define MICRO_ROS_UART_TX_PIN 0u
+#define MICRO_ROS_UART_RX_PIN 1u
+#define MICRO_ROS_UART_BAUD_RATE 115200u
 
-#define CTRL_FORCE_MIN_N -18.5f
-#define CTRL_FORCE_MAX_N 20.0f
+/* true: micro-ROS; false: USB serial telemetry only */
+#define ROS_MODE true
+
+#define CTRL_FORCE_MIN_N -25.0f
+#define CTRL_FORCE_MAX_N 100.0f
 
 #if !PWM_SERIAL_DEBUG_ONLY
-#define ESC_MIN_US 1100u
-#define ESC_NEUTRAL_US 1300u
-#define ESC_MAX_US 1380u
+#define ESC_MIN_US 1020u
+#define ESC_NEUTRAL_US 1400u
+#define ESC_MAX_US 1950u
 #endif
 
-#define ESC_DEADZONE_LOW_US 1300u
-#define ESC_DEADZONE_HIGH_US 1300u
+#define ESC_DEADZONE_LOW_US 1389u
+#define ESC_DEADZONE_HIGH_US 1418u
 
 #define ESC_PWM_FREQUENCY_HZ 50u
 #define ESC_PWM_PERIOD_US (1000000u / ESC_PWM_FREQUENCY_HZ)

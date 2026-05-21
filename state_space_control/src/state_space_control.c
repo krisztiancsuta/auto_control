@@ -69,13 +69,13 @@ void state_space_control_step(void)
   rtb_Gain = ((rtU.r - rtb_Sum2_idx_0) * 2.970182503012524 + 0.60000000000000853 * rtU.r) - rtb_Sum2_idx_1;
 
   /* Saturate: '<S1>/Saturation' */
-  if (rtb_Gain > 9.0)
+  if (rtb_Gain > 20.0)
   {
-    rtb_Gain = 9.0;
+    rtb_Gain = 20.0;
   }
-  else if (rtb_Gain < -10.0)
+  else if (rtb_Gain < -20.0)
   {
-    rtb_Gain = -10.0;
+    rtb_Gain = -20.0;
   }
 
   /* End of Saturate: '<S1>/Saturation' */

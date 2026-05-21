@@ -22,6 +22,8 @@
 #if LIB_PICO_STDIO_USB
 #include "pico/stdio_usb.h"
 #endif
+#else
+#include "serial_cli.h"
 #endif
 
 static PIO g_pio = pio0;
@@ -74,7 +76,7 @@ static void ref_speed_subscription_callback(const void *msgin) {
     restore_interrupts(irq_state);
 }
 
-static bool micro_ros_init_subscription(void) {
+static bool micro_ros_wait_for_agent(void) {
     rmw_uros_set_custom_transport(
         true, NULL,
         pico_serial_transport_open,
@@ -82,7 +84,31 @@ static bool micro_ros_init_subscription(void) {
         pico_serial_transport_write,
         pico_serial_transport_read);
 
-    if (rmw_uros_ping_agent(MICRO_ROS_AGENT_PING_TIMEOUT_MS, MICRO_ROS_AGENT_PING_ATTEMPTS) != RCL_RET_OK) {
+    printf("Pinging micro-ROS agent on UART0 (GP%u TX, GP%u RX)...\r\n",
+           (unsigned int)MICRO_ROS_UART_TX_PIN, (unsigned int)MICRO_ROS_UART_RX_PIN);
+    fflush(stdout);
+
+    for (uint8_t attempt = 1; attempt <= MICRO_ROS_AGENT_PING_ATTEMPTS; attempt++) {
+        printf("  ping %u/%u\r\n", (unsigned int)attempt,
+               (unsigned int)MICRO_ROS_AGENT_PING_ATTEMPTS);
+        fflush(stdout);
+
+        if (rmw_uros_ping_agent(MICRO_ROS_AGENT_PING_TIMEOUT_MS, 1) == RCL_RET_OK) {
+            printf("micro-ROS agent connected.\r\n");
+            fflush(stdout);
+            return true;
+        }
+
+        sleep_ms(50);
+    }
+
+    printf("micro-ROS agent not found.\r\n");
+    fflush(stdout);
+    return false;
+}
+
+static bool micro_ros_init_subscription(void) {
+    if (!micro_ros_wait_for_agent()) {
         return false;
     }
 
@@ -233,13 +259,16 @@ int main(void) {
         fflush(stdout);
     }
 #else
-    stdio_init_all();
-    sleep_ms(USB_SERIAL_BOOT_DELAY_MS);
+    serial_stdio_setup();
+    printf("Waiting for USB serial...\r\n");
+    fflush(stdout);
+    serial_wait_usb();
 
     printf("Control %d Hz, ESC PWM %lu Hz, GPIO %u (NPN)\r\n",
            1000 / CONTROL_PERIOD_MS,
            (unsigned long)pwm_esc_pwm_frequency_hz(),
            (unsigned int)PIN_PWM_ESC);
+    fflush(stdout);
 
     pio_add_program(g_pio, &quadrature_encoder_program);
     quadrature_encoder_program_init(g_pio, g_sm, PIN_ENCODER_AB, 0);
@@ -247,6 +276,7 @@ int main(void) {
     pwm_esc_init(&g_esc, PIN_PWM_ESC, ESC_MIN_US, ESC_NEUTRAL_US, ESC_MAX_US);
     printf("ESC %u-%u us (neutral %u)\r\n",
            (unsigned int)ESC_MIN_US, (unsigned int)ESC_MAX_US, (unsigned int)ESC_NEUTRAL_US);
+    fflush(stdout);
 
     state_space_control_initialize();
 
@@ -261,11 +291,19 @@ int main(void) {
     }
 
     printf("Default ref speed %.2f m/s\r\n", REF_SPEED_MPS_DEFAULT);
+    fflush(stdout);
 
     if (!ROS_MODE) {
-        printf("Serial telemetry mode\r\n");
-    } else if (!micro_ros_init_subscription()) {
-        printf("micro-ROS unavailable, serial telemetry fallback\r\n");
+        printf("Serial telemetry mode (USB debug)\r\n");
+        fflush(stdout);
+    } else {
+        printf("micro-ROS UART0 @ %u baud (USB = debug)\r\n",
+               (unsigned int)MICRO_ROS_UART_BAUD_RATE);
+        fflush(stdout);
+        if (!micro_ros_init_subscription()) {
+            printf("micro-ROS unavailable, USB telemetry fallback\r\n");
+            fflush(stdout);
+        }
     }
 
     while (true) {
@@ -284,7 +322,6 @@ int main(void) {
             ros_publish(&g_control_force_publisher, &g_control_force_msg);
             g_encoder_count_msg.data = (int64_t)pub_encoder_count;
             ros_publish(&g_encoder_count_publisher, &g_encoder_count_msg);
-            continue;
         }
 
         int32_t encoder_count;
@@ -320,6 +357,7 @@ int main(void) {
                (double)ref_speed, (double)error_mps, (double)force_n, (unsigned int)pwm_us,
                (unsigned long)last_interval, (unsigned long)callback_count,
                (unsigned long)min_interval, (unsigned long)max_interval);
+        fflush(stdout);
         sleep_ms(100);
     }
 #endif
