@@ -17,6 +17,14 @@ void serial_stdio_setup(void) {
     setbuf(stdout, NULL);
 }
 
+bool serial_usb_connected(void) {
+#if LIB_PICO_STDIO_USB
+    return stdio_usb_connected();
+#else
+    return true;
+#endif
+}
+
 void serial_wait_usb(void) {
 #if LIB_PICO_STDIO_USB
     while (!stdio_usb_connected()) {
@@ -24,6 +32,22 @@ void serial_wait_usb(void) {
     }
 #endif
     sleep_ms(500);
+}
+
+void serial_wait_usb_optional(uint32_t max_wait_ms) {
+#if LIB_PICO_STDIO_USB
+    uint32_t waited_ms = 0;
+    while (!stdio_usb_connected() && waited_ms < max_wait_ms) {
+        sleep_ms(USB_SERIAL_WAIT_STEP_MS);
+        waited_ms += USB_SERIAL_WAIT_STEP_MS;
+    }
+    if (stdio_usb_connected()) {
+        sleep_ms(500);
+    }
+#else
+    (void)max_wait_ms;
+    sleep_ms(500);
+#endif
 }
 
 bool serial_parse_pulse_us(const char *line, uint16_t *out_us, uint32_t min_us, uint32_t max_us) {

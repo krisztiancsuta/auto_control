@@ -7,6 +7,8 @@
 
 void serial_stdio_setup(void);
 void serial_wait_usb(void);
+bool serial_usb_connected(void);
+void serial_wait_usb_optional(uint32_t max_wait_ms);
 bool serial_parse_pulse_us(const char *line, uint16_t *out_us, uint32_t min_us, uint32_t max_us);
 void serial_read_line(char *line, size_t line_size);
 

@@ -77,11 +77,17 @@ Or copy the UF2 manually to the mounted `RPI-RP2` drive.
 
 ## 4) Serial monitor
 
-After reset, the firmware prints encoder counts over USB CDC.
+USB debug telemetry prints about every 500 ms when a USB host is connected.
 
 ```bash
 ls /dev/tty.usbmodem*
 screen /dev/tty.usbmodemXXXX 115200
+```
+
+micro-ROS uses UART0 (GP0 TX, GP1 RX) at **921600** baud. Start the agent with the same baud:
+
+```bash
+ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyUSB0 -b 921600
 ```
 
 ## Notes

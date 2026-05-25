@@ -9,10 +9,13 @@
 #include "pico_uart_transports.h"
 #include "pwm_esc.h"
 #include "quadrature_encoder.pio.h"
+#include "rcl/context.h"
 #include "rcl/rcl.h"
 #include "rclc/executor.h"
 #include "rclc/rclc.h"
+#include "rmw/ret_types.h"
 #include "rmw_microros/rmw_microros.h"
+#include "rmw_microros/timing.h"
 #include "state_space_control.h"
 #include "std_msgs/msg/float64.h"
 #include "std_msgs/msg/int64.h"
@@ -54,7 +57,26 @@ static rcl_node_t g_node;
 static rcl_subscription_t g_ref_speed_subscription;
 static rclc_executor_t g_executor;
 static std_msgs__msg__Float64 g_ref_speed_msg;
-static bool g_micro_ros_connected = false;
+
+typedef enum {
+    MICRO_ROS_STATE_WAITING_AGENT,
+    MICRO_ROS_STATE_AGENT_AVAILABLE,
+    MICRO_ROS_STATE_AGENT_CONNECTED,
+    MICRO_ROS_STATE_AGENT_DISCONNECTED,
+} micro_ros_state_t;
+
+static micro_ros_state_t g_micro_ros_state = MICRO_ROS_STATE_WAITING_AGENT;
+static bool g_micro_ros_transport_ready = false;
+
+#define EXECUTE_EVERY_N_MS(MS, X)                                                     \
+    do {                                                                              \
+        static uint32_t s_last_ms = 0;                                                \
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());                      \
+        if (now_ms - s_last_ms >= (uint32_t)(MS)) {                                   \
+            s_last_ms = now_ms;                                                       \
+            X;                                                                        \
+        }                                                                             \
+    } while (0)
 
 static rcl_publisher_t g_measured_speed_publisher;
 static rcl_publisher_t g_encoder_count_publisher;
@@ -76,7 +98,16 @@ static void ref_speed_subscription_callback(const void *msgin) {
     restore_interrupts(irq_state);
 }
 
-static bool micro_ros_wait_for_agent(void) {
+static bool micro_ros_agent_ping(void) {
+    return rmw_uros_ping_agent(MICRO_ROS_AGENT_PING_TIMEOUT_MS,
+                               MICRO_ROS_AGENT_PING_ATTEMPTS) == RMW_RET_OK;
+}
+
+static void micro_ros_setup_transport(void) {
+    if (g_micro_ros_transport_ready) {
+        return;
+    }
+
     rmw_uros_set_custom_transport(
         true, NULL,
         pico_serial_transport_open,
@@ -84,34 +115,14 @@ static bool micro_ros_wait_for_agent(void) {
         pico_serial_transport_write,
         pico_serial_transport_read);
 
-    printf("Pinging micro-ROS agent on UART0 (GP%u TX, GP%u RX)...\r\n",
+    g_micro_ros_transport_ready = true;
+    printf("micro-ROS UART0 @ %u baud (GP%u TX, GP%u RX), waiting for agent...\r\n",
+           (unsigned int)MICRO_ROS_UART_BAUD_RATE,
            (unsigned int)MICRO_ROS_UART_TX_PIN, (unsigned int)MICRO_ROS_UART_RX_PIN);
     fflush(stdout);
-
-    for (uint8_t attempt = 1; attempt <= MICRO_ROS_AGENT_PING_ATTEMPTS; attempt++) {
-        printf("  ping %u/%u\r\n", (unsigned int)attempt,
-               (unsigned int)MICRO_ROS_AGENT_PING_ATTEMPTS);
-        fflush(stdout);
-
-        if (rmw_uros_ping_agent(MICRO_ROS_AGENT_PING_TIMEOUT_MS, 1) == RCL_RET_OK) {
-            printf("micro-ROS agent connected.\r\n");
-            fflush(stdout);
-            return true;
-        }
-
-        sleep_ms(50);
-    }
-
-    printf("micro-ROS agent not found.\r\n");
-    fflush(stdout);
-    return false;
 }
 
-static bool micro_ros_init_subscription(void) {
-    if (!micro_ros_wait_for_agent()) {
-        return false;
-    }
-
+static bool micro_ros_create_entities(void) {
     g_allocator = rcl_get_default_allocator();
     g_support = (rclc_support_t){0};
     g_node = rcl_get_zero_initialized_node();
@@ -158,8 +169,83 @@ static bool micro_ros_init_subscription(void) {
         return false;
     }
 
-    g_micro_ros_connected = true;
+    printf("micro-ROS agent connected.\r\n");
+    fflush(stdout);
     return true;
+}
+
+static void micro_ros_destroy_entities(void) {
+    rmw_context_t *rmw_context = rcl_context_get_rmw_context(&g_support.context);
+    if (rmw_context != NULL) {
+        (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+    }
+
+    (void)rcl_publisher_fini(&g_measured_speed_publisher, &g_node);
+    (void)rcl_publisher_fini(&g_encoder_count_publisher, &g_node);
+    (void)rcl_publisher_fini(&g_control_force_publisher, &g_node);
+    (void)rcl_subscription_fini(&g_ref_speed_subscription, &g_node);
+    (void)rclc_executor_fini(&g_executor);
+    (void)rcl_node_fini(&g_node);
+    (void)rclc_support_fini(&g_support);
+
+    uint32_t irq_state = save_and_disable_interrupts();
+    g_ref_speed_mps = REF_SPEED_MPS_DEFAULT;
+    restore_interrupts(irq_state);
+
+    printf("micro-ROS agent lost, waiting for reconnect...\r\n");
+    fflush(stdout);
+}
+
+static void micro_ros_step(void) {
+    switch (g_micro_ros_state) {
+    case MICRO_ROS_STATE_WAITING_AGENT:
+        EXECUTE_EVERY_N_MS(MICRO_ROS_AGENT_WAIT_PING_INTERVAL_MS,
+                           g_micro_ros_state = micro_ros_agent_ping()
+                                                   ? MICRO_ROS_STATE_AGENT_AVAILABLE
+                                                   : MICRO_ROS_STATE_WAITING_AGENT);
+        break;
+
+    case MICRO_ROS_STATE_AGENT_AVAILABLE:
+        if (micro_ros_create_entities()) {
+            g_micro_ros_state = MICRO_ROS_STATE_AGENT_CONNECTED;
+        } else {
+            micro_ros_destroy_entities();
+            g_micro_ros_state = MICRO_ROS_STATE_WAITING_AGENT;
+        }
+        break;
+
+    case MICRO_ROS_STATE_AGENT_CONNECTED:
+        EXECUTE_EVERY_N_MS(MICRO_ROS_AGENT_CONNECTED_PING_INTERVAL_MS,
+                           g_micro_ros_state = micro_ros_agent_ping()
+                                                   ? MICRO_ROS_STATE_AGENT_CONNECTED
+                                                   : MICRO_ROS_STATE_AGENT_DISCONNECTED);
+        if (g_micro_ros_state == MICRO_ROS_STATE_AGENT_CONNECTED) {
+            (void)rclc_executor_spin_some(&g_executor, RCL_MS_TO_NS(100));
+
+            uint32_t irq_state_pub = save_and_disable_interrupts();
+            int32_t pub_encoder_count = g_encoder_count;
+            float pub_speed_mps = g_measured_speed_mps;
+            float pub_control_force_n = g_control_force_n;
+            restore_interrupts(irq_state_pub);
+
+            g_measured_speed_msg.data = (double)pub_speed_mps;
+            ros_publish(&g_measured_speed_publisher, &g_measured_speed_msg);
+            g_control_force_msg.data = (double)pub_control_force_n;
+            ros_publish(&g_control_force_publisher, &g_control_force_msg);
+            g_encoder_count_msg.data = (int64_t)pub_encoder_count;
+            ros_publish(&g_encoder_count_publisher, &g_encoder_count_msg);
+        }
+        break;
+
+    case MICRO_ROS_STATE_AGENT_DISCONNECTED:
+        micro_ros_destroy_entities();
+        g_micro_ros_state = MICRO_ROS_STATE_WAITING_AGENT;
+        break;
+
+    default:
+        g_micro_ros_state = MICRO_ROS_STATE_WAITING_AGENT;
+        break;
+    }
 }
 
 static inline float clampf(float x, float lo, float hi) {
@@ -211,12 +297,21 @@ static bool control_timer_callback(struct repeating_timer *t) {
 
     float y_mps = ((float)delta * meters_per_count) / CONTROL_DT_S;
 
-    rtU.r = (real_T)g_ref_speed_mps;
-    rtU.y = (real_T)y_mps;
-    state_space_control_step();
+    float ref_speed_mps = g_ref_speed_mps;
+    float uc_n;
+    uint16_t pwm_us;
 
-    float uc_n = (float)rtY.uc;
-    uint16_t pwm_us = force_to_pwm_us(uc_n);
+    if (ref_speed_mps >= REF_SPEED_HOLD_MIN_MPS && ref_speed_mps <= REF_SPEED_HOLD_MAX_MPS) {
+        uc_n = 0.0f;
+        pwm_us = ESC_NEUTRAL_US;
+    } else {
+        rtU.r = (real_T)ref_speed_mps;
+        rtU.y = (real_T)y_mps;
+        state_space_control_step();
+        uc_n = (float)rtY.uc;
+        pwm_us = force_to_pwm_us(uc_n);
+    }
+
     pwm_esc_set_speed_us(&g_esc, pwm_us);
 
     g_encoder_count = encoder_now;
@@ -260,9 +355,13 @@ int main(void) {
     }
 #else
     serial_stdio_setup();
-    printf("Waiting for USB serial...\r\n");
+    serial_wait_usb_optional(USB_SERIAL_BOOT_DELAY_MS);
+    if (serial_usb_connected()) {
+        printf("USB serial connected.\r\n");
+    } else {
+        printf("USB serial not connected (debug optional, control continues).\r\n");
+    }
     fflush(stdout);
-    serial_wait_usb();
 
     printf("Control %d Hz, ESC PWM %lu Hz, GPIO %u (NPN)\r\n",
            1000 / CONTROL_PERIOD_MS,
@@ -297,31 +396,12 @@ int main(void) {
         printf("Serial telemetry mode (USB debug)\r\n");
         fflush(stdout);
     } else {
-        printf("micro-ROS UART0 @ %u baud (USB = debug)\r\n",
-               (unsigned int)MICRO_ROS_UART_BAUD_RATE);
-        fflush(stdout);
-        if (!micro_ros_init_subscription()) {
-            printf("micro-ROS unavailable, USB telemetry fallback\r\n");
-            fflush(stdout);
-        }
+        micro_ros_setup_transport();
     }
 
     while (true) {
-        if (ROS_MODE && g_micro_ros_connected) {
-            (void)rclc_executor_spin_some(&g_executor, RCL_MS_TO_NS(100));
-
-            uint32_t irq_state_pub = save_and_disable_interrupts();
-            int32_t pub_encoder_count = g_encoder_count;
-            float pub_speed_mps = g_measured_speed_mps;
-            float pub_control_force_n = g_control_force_n;
-            restore_interrupts(irq_state_pub);
-
-            g_measured_speed_msg.data = (double)pub_speed_mps;
-            ros_publish(&g_measured_speed_publisher, &g_measured_speed_msg);
-            g_control_force_msg.data = (double)pub_control_force_n;
-            ros_publish(&g_control_force_publisher, &g_control_force_msg);
-            g_encoder_count_msg.data = (int64_t)pub_encoder_count;
-            ros_publish(&g_encoder_count_publisher, &g_encoder_count_msg);
+        if (ROS_MODE) {
+            micro_ros_step();
         }
 
         int32_t encoder_count;
@@ -349,16 +429,21 @@ int main(void) {
         max_interval = g_max_interval_us;
         restore_interrupts(irq_state);
 
-        elapsed_ms = to_ms_since_boot(get_absolute_time());
-        printf("elapsed_ms=%lu encoder_count=%ld speed_mps=%.4f ref_speed=%.4f error_mps=%.4f "
-               "force_n=%.4f pwm_us=%u last_interval=%lu callback_count=%lu min_interval=%lu "
-               "max_interval=%lu\r\n",
-               (unsigned long)elapsed_ms, (long)encoder_count, (double)speed_mps,
-               (double)ref_speed, (double)error_mps, (double)force_n, (unsigned int)pwm_us,
-               (unsigned long)last_interval, (unsigned long)callback_count,
-               (unsigned long)min_interval, (unsigned long)max_interval);
-        fflush(stdout);
-        sleep_ms(100);
+        if (serial_usb_connected()) {
+            EXECUTE_EVERY_N_MS(USB_TELEMETRY_PERIOD_MS, {
+                elapsed_ms = to_ms_since_boot(get_absolute_time());
+                printf("elapsed_ms=%lu encoder_count=%ld speed_mps=%.4f ref_speed=%.4f error_mps=%.4f "
+                       "force_n=%.4f pwm_us=%u last_interval=%lu callback_count=%lu min_interval=%lu "
+                       "max_interval=%lu ros_state=%u\r\n",
+                       (unsigned long)elapsed_ms, (long)encoder_count, (double)speed_mps,
+                       (double)ref_speed, (double)error_mps, (double)force_n, (unsigned int)pwm_us,
+                       (unsigned long)last_interval, (unsigned long)callback_count,
+                       (unsigned long)min_interval, (unsigned long)max_interval,
+                       ROS_MODE ? (unsigned int)g_micro_ros_state : 0u);
+                fflush(stdout);
+            });
+        }
+        sleep_ms(MAIN_LOOP_PERIOD_MS);
     }
 #endif
 }
